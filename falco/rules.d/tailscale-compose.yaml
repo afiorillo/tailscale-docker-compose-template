@@ -1,0 +1,146 @@
+# Custom Falco rules for the tailscale-caddy-docker-compose stack.
+#
+# These rules supplement Falco's default ruleset (which covers many common
+# attack patterns). They are scoped to the containers in this stack.
+#
+# Falco evaluates rules against kernel syscall events via eBPF. It detects
+# the *effects* of unexpected code paths — for example, a web server spawning
+# a shell implies RCE even without source-level instrumentation. For tracing
+# individual C/Go functions inside binaries, see Cilium Tetragon uprobes
+# (https://tetragon.io/docs/concepts/tracing-policy/selectors/).
+#
+# Tune these rules to your environment:
+#   - Update 'web_container_images' to match whatever image your 'web' service uses.
+#   - Add expected process names to the allow-lists if legitimate tools trigger alerts.
+#   - Adjust priorities to match your alerting thresholds.
+#
+# Test rules without restarting: falco --dry-run -r /etc/falco/rules.d/tailscale-compose.yaml
+
+# ── Lists ────────────────────────────────────────────────────────────────────
+
+# Images used by the web service in this stack. Update when you swap the service.
+- list: web_container_images
+  items: [caddy, nginx, traefik, httpd]
+
+# Processes that are legitimately expected inside the web container.
+# Add any that your service requires (e.g. php-fpm, node).
+- list: expected_web_procs
+  items: [caddy, nginx, httpd, node, python3, ruby, java]
+
+# Processes that are legitimately expected inside the tailscale container.
+- list: expected_tailscale_procs
+  items: [tailscaled, tailscale, ip, iptables, ip6tables, modprobe, sh]
+
+# ── Rules ────────────────────────────────────────────────────────────────────
+
+# Detect shell spawned inside the web container.
+# A legitimate web server should never need to exec a shell; this is a
+# strong indicator of remote code execution (RCE).
+- rule: Shell spawned in web container
+  desc: >
+    A shell process was executed inside the web container. This typically
+    indicates remote code execution via a vulnerability in the web application.
+  condition: >
+    spawned_process and
+    container.image.repository in (web_container_images) and
+    proc.name in (shell_binaries)
+  output: >
+    Shell spawned in web container
+    (shell=%proc.name cmdline=%proc.cmdline user=%user.name
+     container=%container.name image=%container.image.repository
+     parent=%proc.pname)
+  priority: CRITICAL
+  tags: [container, process, mitre_execution, rce]
+
+# Detect unexpected processes in the web container.
+# A compromised web server may exec tools like curl, wget, or nc to exfiltrate
+# data or download a second-stage payload.
+- rule: Unexpected process in web container
+  desc: >
+    A process that is not in the expected list ran inside the web container.
+    This may indicate post-exploitation tooling (downloaders, reverse shells).
+  condition: >
+    spawned_process and
+    container.image.repository in (web_container_images) and
+    not proc.name in (expected_web_procs) and
+    not proc.name in (shell_binaries)
+  output: >
+    Unexpected process in web container
+    (proc=%proc.name cmdline=%proc.cmdline user=%user.name
+     container=%container.name image=%container.image.repository)
+  priority: WARNING
+  tags: [container, process, mitre_execution]
+
+# Detect unexpected processes in the Tailscale container.
+- rule: Unexpected process in tailscale container
+  desc: >
+    A process that is not the Tailscale daemon ran in the tailscale container.
+    The tailscale container is privileged (net_admin); compromise here is severe.
+  condition: >
+    spawned_process and
+    container.image.repository = "tailscale/tailscale" and
+    not proc.name in (expected_tailscale_procs)
+  output: >
+    Unexpected process in tailscale container
+    (proc=%proc.name cmdline=%proc.cmdline user=%user.name
+     container=%container.name)
+  priority: CRITICAL
+  tags: [container, process, mitre_execution]
+
+# Detect outbound network connections from the web container.
+# With internal:true Docker networking, this should be impossible via direct
+# routing. If Falco fires here, something bypassed the network isolation
+# (e.g. by proxying through Tailscale's SOCKS5 port or via misconfiguration).
+- rule: Outbound connection from web container
+  desc: >
+    The web container initiated an outbound network connection. With the
+    internal Docker network, this suggests a misconfiguration or an attacker
+    pivoting through an exposed local proxy.
+  condition: >
+    outbound and
+    container.image.repository in (web_container_images)
+  output: >
+    Outbound connection from web container
+    (connection=%fd.name proc=%proc.name user=%user.name
+     container=%container.name image=%container.image.repository)
+  priority: WARNING
+  tags: [container, network, mitre_exfiltration]
+
+# Detect writes to sensitive filesystem paths inside any container.
+# Web servers and VPN daemons generally should not modify /etc, /usr, or /bin.
+# Read-only volume mounts (the :ro flags in docker-compose.yml) provide a
+# first layer of defence; Falco provides visibility if a writable path is used.
+- rule: Write to sensitive path in container
+  desc: >
+    A process wrote to /etc/, /usr/, or /bin/ inside a container. These paths
+    are typically read-only at runtime; writes may indicate an active exploit
+    or a container escape attempt.
+  condition: >
+    open_write and
+    container and
+    (fd.name startswith /etc/ or
+     fd.name startswith /usr/ or
+     fd.name startswith /bin/)
+  output: >
+    Write to sensitive path in container
+    (path=%fd.name proc=%proc.name user=%user.name
+     container=%container.name image=%container.image.repository)
+  priority: ERROR
+  tags: [container, filesystem, mitre_persistence]
+
+# Detect container escapes via /proc/self/mem or similar.
+- rule: Container escape via proc
+  desc: >
+    A process accessed /proc paths commonly used in container escape exploits
+    (e.g. /proc/self/mem, /proc/sysrq-trigger).
+  condition: >
+    open_write and
+    container and
+    (fd.name startswith /proc/self/mem or
+     fd.name = /proc/sysrq-trigger)
+  output: >
+    Possible container escape attempt
+    (path=%fd.name proc=%proc.name user=%user.name
+     container=%container.name image=%container.image.repository)
+  priority: CRITICAL
+  tags: [container, escape, mitre_privilege_escalation]
