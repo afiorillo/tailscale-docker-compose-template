@@ -1,7 +1,7 @@
 # Docker Compose template — service behind Tailscale
 
 Expose a containerised service as its own host in your Tailscale tailnet with
-automatic HTTPS, network isolation, and runtime security monitoring.
+automatic HTTPS and network isolation.
 
 ## Architecture
 
@@ -19,13 +19,13 @@ automatic HTTPS, network isolation, and runtime security monitoring.
    │  web container (Caddy / any HTTP service)             │
    │  • no direct internet access                          │
    │  • no published host ports                            │
-   └───────────────────────────────────────────────────────┘
-        │ eBPF / kernel syscall events
+   │  • outbound via proxy only (HTTP_PROXY / HTTPS_PROXY) │
+   └────┬──────────────────────────────────────────────────┘
+        │
    ┌────▼──────────────────────────────────────────────────┐
-   │  falco container (optional)                           │
-   │  • alerts on anomalous process execution              │
-   │  • alerts on unexpected network connections           │
-   │  • alerts on writes to protected paths                │
+   │  proxy container (Caddy forwardproxy)                 │
+   │  • default-deny outbound allowlist (proxy/Caddyfile)  │
+   │  • logs denied connection attempts to stdout          │
    └───────────────────────────────────────────────────────┘
 ```
 
@@ -192,47 +192,13 @@ The `HTTP_PROXY` and `HTTPS_PROXY` env vars are set on the web service in
 `net/http`, `node-fetch`) respect them automatically. Add destinations to
 `NO_PROXY` to bypass the proxy for specific hosts (e.g. internal services).
 
-### Runtime monitoring (Falco)
-
-The optional `falco` service uses eBPF to monitor kernel syscalls across all
-containers on the host. It detects anomalous behaviour at runtime, including:
-
-| Detection | Example signal |
-|---|---|
-| Remote code execution | Web container spawns `/bin/bash` |
-| Post-exploitation tooling | Unexpected `curl`, `wget`, or `nc` in a container |
-| Exfiltration attempt | Outbound connection from an isolated container |
-| Persistence | Write to `/etc/` or `/usr/` inside a container |
-| Container escape | Access to `/proc/self/mem` |
-
-Falco works at the **syscall level**, not the source level. It cannot directly
-measure code coverage, but it alerts on the *effects* of low-probability or
-unexpected code paths — a web server that suddenly calls `execve("/bin/sh")`
-is behaving anomalously regardless of which source line triggered it.
-
-For deeper binary-level tracing (alerting when a specific C or Go function
-executes inside a container), see
-[Cilium Tetragon](https://tetragon.io/docs/concepts/tracing-policy/selectors/)
-which uses eBPF uprobes attached to user-space functions.
-
-Custom rules are in [`falco/rules.d/tailscale-compose.yaml`](falco/rules.d/tailscale-compose.yaml).
-Edit the `web_container_images` list to match your service's image.
-
-**Requirements:**
-- Linux kernel ≥ 5.8 (for the `falco-no-driver` eBPF probe)
-- For older kernels, replace `falcosecurity/falco-no-driver` with
-  `falcosecurity/falco` and configure the kernel module driver
-
-To disable monitoring entirely, comment out the `falco` service in
-`docker-compose.yml`.
-
 ### Hardening checklist
 
 - [ ] Auth key is ephemeral and scoped to an ACL tag
 - [ ] ACL policy restricts which tailnet peers can reach this node
 - [ ] `AllowFunnel` is `false` in `serve.json` (unless you intend public access)
 - [ ] Web container image is pinned to a specific digest in production
-- [ ] Falco alerts are forwarded to a SIEM or alerting channel
+- [ ] Outbound allowlist in `proxy/Caddyfile` is as narrow as possible
 
 ## Tips
 
