@@ -27,6 +27,10 @@ services:
   #   - service name must be "web" (referenced in tsconfig/serve.json)
   #   - must listen on port 8080 inside the container (or update serve.json)
   #   - do NOT add a 'ports:' mapping — all inbound traffic comes via Tailscale
+  #     Exception: bind to loopback to make the service accessible on the host
+  #     itself without going through Tailscale (e.g. for local debugging):
+  #     ports:
+  #       - "127.0.0.1:9090:8080"
   #
   # Outbound connections: the web container has no internet gateway by default.
   # HTTP_PROXY / HTTPS_PROXY point to the Caddy forward proxy, which enforces
