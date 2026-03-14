@@ -156,48 +156,41 @@ provides no default internet gateway on this network, so:
 
 #### Allowing whitelisted outbound connections
 
-If your application needs to reach specific external URLs or IPs, route those
-connections through Tailscale's built-in proxy rather than giving the web
-container direct internet access. This keeps Tailscale ACLs as the enforcement
-point.
+Outbound connections from the web container are routed through a Caddy forward
+proxy sidecar ([`caddyserver/forwardproxy`](https://github.com/caddyserver/forwardproxy)).
+The allowlist lives in [`proxy/Caddyfile`](proxy/Caddyfile) — it is the single
+source of truth for what the web container can reach. All other destinations
+are denied and logged.
 
-**Step 1 — enable the proxy in `TS_EXTRA_ARGS`:**
+**To permit a destination**, add an `allow ips` line to the `acl` block in
+`proxy/Caddyfile` and rebuild:
 
-```sh
-# .env
-TS_EXTRA_ARGS=--reset --socks5-server=0.0.0.0:1080 --outbound-http-proxy-listen=0.0.0.0:8118
 ```
-
-| Flag | Protocol | Env var in web container |
-|---|---|---|
-| `--socks5-server=0.0.0.0:1080` | SOCKS5 (all TCP) | `ALL_PROXY=socks5://tailscale:1080` |
-| `--outbound-http-proxy-listen=0.0.0.0:8118` | HTTP CONNECT | `HTTP_PROXY=http://tailscale:8118` and `HTTPS_PROXY=http://tailscale:8118` |
-
-**Step 2 — uncomment the proxy env vars in the `web` service** (see
-`docker-compose.yml` comments).
-
-**Step 3 — define the whitelist in your Tailscale ACL policy:**
-
-```json
-{
-  "acls": [
-    {
-      "action": "accept",
-      "src": ["tag:myservice"],
-      "dst": ["93.184.216.34:443"]   // example: example.com
-    }
-  ]
+acl {
+    allow ips 93.184.216.34        # example.com
+    allow ips 140.82.112.0/20      # github.com range
+    deny  all
 }
 ```
 
-Tailscale's default deny policy blocks all destinations not explicitly listed,
-so the ACL rule is the whitelist. Use IP addresses or Tailscale hostnames;
-arbitrary DNS names require an exit node or [Split DNS](https://tailscale.com/kb/1054/dns).
+```sh
+docker compose build proxy && docker compose up -d proxy
+```
 
-Most HTTP libraries (`curl`, `python-requests`, Go `net/http`, Node `node-fetch`)
-respect `ALL_PROXY`, `HTTP_PROXY`, and `HTTPS_PROXY` automatically.
-Add `NO_PROXY=localhost,127.0.0.1,tailscale` to bypass the proxy for
-loopback and sidecar communication.
+To look up IPs for a hostname:
+```sh
+docker run --rm --network=${SERVICE_NAME}_egress alpine nslookup example.com
+```
+
+Denied connection attempts are logged as errors to stdout:
+```sh
+docker logs forward-proxy
+```
+
+The `HTTP_PROXY` and `HTTPS_PROXY` env vars are set on the web service in
+`docker-compose.yml`. Most HTTP clients (`curl`, `python-requests`, Go
+`net/http`, `node-fetch`) respect them automatically. Add destinations to
+`NO_PROXY` to bypass the proxy for specific hosts (e.g. internal services).
 
 ### Runtime monitoring (Falco)
 

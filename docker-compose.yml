@@ -3,25 +3,17 @@ name: ${SERVICE_NAME}
 # Network architecture:
 #
 #   [internet] ←──→ [tailscale] ←──→ [app network] ←──→ [web]
-#                       ↑
-#                    [egress network]
+#                       ↑                   ↑
+#                  [egress network]      [proxy] ─── egress ──→ [internet]
 #
-# The 'app' network uses internal:true, meaning Docker provides no default
-# internet gateway. The web container can only receive traffic forwarded by
-# Tailscale and cannot make direct outbound internet connections.
-#
-# The 'egress' network is a regular bridge that gives the tailscale container
-# internet access for the coordination server and WireGuard VPN tunnel.
+# 'app' is internal:true — no default internet gateway.
+# Outbound connections from 'web' must go through the 'proxy' service.
+# 'proxy' and 'tailscale' are the only containers with egress internet access.
 
 networks:
-  # Isolated internal network. Containers here cannot route to the internet
-  # directly. All external connectivity is mediated by the tailscale container.
   app:
-    internal: true
-
-  # Internet-facing network. Only the tailscale container joins this, so it
-  # can reach login.tailscale.com and maintain the WireGuard tunnel.
-  egress:
+    internal: true  # no internet gateway; web cannot make direct outbound connections
+  egress:           # internet-facing; only proxy and tailscale join this
 
 volumes:
   caddy_data:
@@ -36,30 +28,11 @@ services:
   #   - must listen on port 8080 inside the container (or update serve.json)
   #   - do NOT add a 'ports:' mapping — all inbound traffic comes via Tailscale
   #
-  # ── Outbound internet access (whitelisting) ────────────────────────────────
-  # By default the web container is on an internal Docker network with no
-  # internet gateway. To allow specific outbound connections, route them
-  # through Tailscale's SOCKS5 or HTTP proxy (enabled in the tailscale
-  # service below via TS_EXTRA_ARGS). Destination whitelisting is enforced
-  # by your Tailscale ACL policy — see https://tailscale.com/kb/1018/acls
-  #
-  # Uncomment and configure the proxy env vars below for your use case:
-  #
-  #   ALL_PROXY=socks5://tailscale:1080
-  #     Routes all outbound TCP through the SOCKS5 proxy. Most HTTP clients
-  #     (curl, python-requests, Go net/http) respect this automatically.
-  #
-  #   HTTP_PROXY=http://tailscale:8118
-  #   HTTPS_PROXY=http://tailscale:8118
-  #     Routes HTTP/HTTPS only; use when ALL_PROXY causes issues (e.g. gRPC).
-  #
-  #   NO_PROXY=localhost,127.0.0.1,tailscale
-  #     Bypass the proxy for loopback and the Tailscale sidecar itself.
-  #
-  # To restrict which destinations are reachable, add an ACL rule in the
-  # Tailscale admin console that allows only the specific IPs or hostnames
-  # your service needs to contact. All other outbound traffic is blocked
-  # by the ACL deny-by-default policy.
+  # Outbound connections: the web container has no internet gateway by default.
+  # HTTP_PROXY / HTTPS_PROXY point to the Caddy forward proxy, which enforces
+  # the allowlist defined in proxy/Caddyfile. Most HTTP clients (curl,
+  # python-requests, Go net/http, node-fetch) respect these env vars automatically.
+  # Add NO_PROXY for destinations that should bypass the proxy entirely.
   web:
     image: caddy:2
     container_name: caddy-server
@@ -68,28 +41,48 @@ services:
       - ./www/:/usr/share/caddy/:ro
       - caddy_data:/data
     environment:
-      # Uncomment to allow outbound connections via Tailscale's proxy.
-      # Requires --socks5-server / --outbound-http-proxy-listen in TS_EXTRA_ARGS.
-      # - ALL_PROXY=socks5://tailscale:1080
-      # - HTTP_PROXY=http://tailscale:8118
-      # - HTTPS_PROXY=http://tailscale:8118
-      # - NO_PROXY=localhost,127.0.0.1,tailscale
+      - HTTP_PROXY=http://proxy:8080
+      - HTTPS_PROXY=http://proxy:8080
+      - NO_PROXY=localhost,127.0.0.1,tailscale
     networks:
-      - app              # internal only — no direct internet access
+      - app
     depends_on:
       - tailscale
+      - proxy
     restart: unless-stopped
     security_opt:
-      - no-new-privileges:true    # block setuid/setgid privilege escalation
+      - no-new-privileges:true
     cap_drop:
-      - ALL               # drop all Linux capabilities
+      - ALL
     cap_add:
-      - NET_BIND_SERVICE  # allow binding ports < 1024 if needed by your service
+      - NET_BIND_SERVICE
+
+  # ─── Outbound proxy ────────────────────────────────────────────────────────
+  # Caddy with the forwardproxy plugin enforces the outbound allowlist.
+  # Edit proxy/Caddyfile to add permitted destination IPs/CIDRs.
+  # Denied requests are logged to stdout — view with: docker logs forward-proxy
+  #
+  # Built locally because the forwardproxy plugin is not in the official
+  # Caddy image. The build is cached after the first run.
+  proxy:
+    build: ./proxy
+    container_name: forward-proxy
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+    networks:
+      - app     # web container reaches proxy here
+      - egress  # proxy makes permitted outbound connections here
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
 
   # ─── Tailscale ─────────────────────────────────────────────────────────────
-  # Acts as the secure gateway. Receives inbound traffic from your tailnet
-  # and forwards it to the web service. Also the only container with a route
-  # to the internet (via the 'egress' network).
+  # Secure inbound gateway. Terminates TLS and reverse-proxies to the web
+  # service. Also on the egress network for the WireGuard coordination server.
   tailscale:
     image: tailscale/tailscale:stable
     hostname: ${SERVICE_NAME}
@@ -104,19 +97,7 @@ services:
       - TS_AUTHKEY=${TS_AUTHKEY}
 
       # Extra CLI flags passed to 'tailscale up'.
-      # --reset            clears stale serve config left from a previous run.
-      #
-      # To enable outbound proxy support (for the web container whitelist):
-      # --socks5-server=0.0.0.0:1080
-      #   Starts a SOCKS5 proxy bound to all interfaces. The web container
-      #   can use ALL_PROXY=socks5://tailscale:1080 to route outbound TCP
-      #   through Tailscale. Destinations are filtered by Tailscale ACLs.
-      # --outbound-http-proxy-listen=0.0.0.0:8118
-      #   Starts an HTTP CONNECT proxy. Use HTTP_PROXY / HTTPS_PROXY in
-      #   the web container. Can be used alongside or instead of SOCKS5.
-      #
-      # Example with both proxies enabled:
-      #   TS_EXTRA_ARGS=--reset --socks5-server=0.0.0.0:1080 --outbound-http-proxy-listen=0.0.0.0:8118
+      # --reset clears stale serve config left from a previous run.
       - TS_EXTRA_ARGS=${TS_EXTRA_ARGS:---reset}
 
       - TS_STATE_DIR=/var/lib/tailscale
@@ -125,11 +106,11 @@ services:
       - ts-lib-var:/var/lib/tailscale
       - /dev/net/tun:/dev/net/tun
     cap_add:
-      - net_admin    # required to configure the WireGuard tunnel interface
-      - sys_module   # required to load kernel modules (wireguard)
+      - net_admin   # required to configure the WireGuard tunnel interface
+      - sys_module  # required to load kernel modules (wireguard)
     networks:
-      - app          # reaches the web service by hostname "web"
-      - egress       # reaches the Tailscale coordination server
+      - app         # reaches the web service by hostname "web"
+      - egress      # reaches the Tailscale coordination server
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -137,28 +118,20 @@ services:
   # ─── Falco (optional) ──────────────────────────────────────────────────────
   # Runtime security monitor using eBPF. Detects anomalous kernel activity:
   #   • unexpected shell or binary execution inside containers
-  #   • suspicious outbound network connections
   #   • writes to protected filesystem paths
   #   • privilege escalation attempts
   #
-  # Falco operates at the syscall level, so it alerts on the *effects* of
-  # unusual code paths — for example, a web server spawning a shell suggests
-  # RCE even when you don't have the source. For deeper binary-level tracing
-  # (e.g. alerting when a specific C function is called) see Cilium Tetragon
-  # (https://tetragon.io), which uses eBPF uprobes.
+  # Note: Falco requires host-level kernel access. Only one Falco instance
+  # can run per host — if you have multiple stacks, run Falco as a host
+  # service instead and load falco/rules.d/ into its rules path.
+  # Comment out this service if Falco is already running on the host.
   #
-  # Requires: Linux kernel ≥ 5.8 (for the eBPF probe used by falco-no-driver).
-  # For older kernels use 'falcosecurity/falco' with the kernel module driver.
-  #
-  # Trade-off: privileged mode is needed for kernel eBPF access. This gives
-  # Falco broad visibility but increases its own attack surface.
-  #
-  # To disable monitoring, comment out this entire service.
+  # Requires: Linux kernel ≥ 5.8 (for the falco-no-driver eBPF probe).
   falco:
     image: falcosecurity/falco-no-driver:latest
     container_name: falco
-    privileged: true          # required for eBPF kernel probe
-    pid: host                 # required to correlate kernel events to processes
+    privileged: true  # required for eBPF kernel probe
+    pid: host         # required to correlate kernel events to processes
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /proc:/host/proc:ro
@@ -168,8 +141,7 @@ services:
       - /etc:/host/etc:ro
       - ./falco/rules.d/:/etc/falco/rules.d/:ro
     environment:
-      # Use the modern eBPF driver — no kernel module installation required.
-      - FALCO_BPF_PROBE=
+      - FALCO_BPF_PROBE=  # use modern eBPF driver, no kernel module required
     networks:
       - app
     restart: unless-stopped
