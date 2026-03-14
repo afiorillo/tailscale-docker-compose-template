@@ -1,0 +1,108 @@
+// Tailscale Serve configuration — annotated reference
+//
+// This file documents every supported field. Copy the relevant parts into
+// tsconfig/serve.json (which must be valid JSON, no comments).
+//
+// Official KB:  https://tailscale.com/kb/1312/serve
+// Serve examples: https://tailscale.com/kb/1313/serve-examples
+// Source types: https://github.com/tailscale/tailscale/blob/main/ipn/serve.go
+//
+// Key concept: Tailscale Serve exposes services to your tailnet only.
+//              Tailscale Funnel (AllowFunnel: true) exposes them to the internet.
+//
+// ${TS_CERT_DOMAIN} is set automatically by Tailscale to your node's
+// MagicDNS hostname, e.g. "mynode.tail12345.ts.net".
+{
+
+  // ── TCP ──────────────────────────────────────────────────────────────────
+  // Raw TCP port handlers. These run before the HTTP layer.
+  // Key: port number (as a string).
+  // Value: exactly one of HTTPS or TCPForward must be set.
+  "TCP": {
+
+    // HTTPS: true
+    //   Tailscale terminates TLS (using its own certificate) and forwards
+    //   the decrypted HTTP request to the matching Web handler below.
+    //   Use this for standard HTTP services.
+    "443": { "HTTPS": true },
+
+    // HTTPS: false
+    //   Port 80 is treated as plain HTTP, no TLS termination.
+    //   Useful for redirects or health-check endpoints.
+    "80":  { "HTTPS": false },
+
+    // TCPForward: "host:port"
+    //   Forward raw TCP bytes without inspecting or terminating TLS.
+    //   Tailscale does NOT issue a certificate for this port.
+    //   Use for SSH, database connections, game servers, etc.
+    //   The target "host" is resolved inside the Tailscale container,
+    //   so Docker service names work (e.g. "postgres:5432").
+    //
+    // "2222": { "TCPForward": "ssh-host:22" },
+    // "5432": { "TCPForward": "postgres:5432" }
+
+    // ── UDP note ────────────────────────────────────────────────────────
+    // UDP is NOT part of ServeConfig. UDP traffic is handled at the
+    // Tailscale network routing layer via ACL rules or subnet routing —
+    // not through this file.
+  },
+
+  // ── Web ──────────────────────────────────────────────────────────────────
+  // HTTP/HTTPS request handlers, keyed by "hostname:port".
+  // The TCP section must have a matching entry for the port (HTTPS or plain).
+  // Only ports configured under TCP are listened on.
+  "Web": {
+
+    // HTTPS handler on port 443 (TLS terminated by the TCP entry above).
+    "${TS_CERT_DOMAIN}:443": {
+      "Handlers": {
+
+        // The key is a path prefix. "/" matches everything.
+        // More-specific prefixes take priority over less-specific ones.
+        "/": {
+
+          // Proxy: forward requests to this URL.
+          //   Use Docker Compose service names as hostnames.
+          //   The scheme (http/https) and port must match what the
+          //   target container is listening on.
+          "Proxy": "http://web:8080"
+
+          // ── Alternatives (use at most one per handler) ─────────────
+          //
+          // Path: serve static files from a local filesystem path.
+          //   The path is resolved inside the Tailscale container.
+          // "Path": "/var/www/html"
+          //
+          // Text: return a static string response.
+          // "Text": "ok"
+        },
+
+        // Example: route /api/ to a separate backend service.
+        // "/api/": { "Proxy": "http://api-service:3000" },
+
+        // Example: serve a health endpoint as static text.
+        // "/healthz": { "Text": "ok" }
+      }
+    },
+
+    // Plain HTTP handler on port 80 (no TLS termination).
+    // You can proxy to the same backend or return a redirect via a static text.
+    "${TS_CERT_DOMAIN}:80": {
+      "Handlers": {
+        "/": { "Proxy": "http://web:8080" }
+      }
+    }
+  },
+
+  // ── AllowFunnel ──────────────────────────────────────────────────────────
+  // Controls whether the port is accessible from the public internet via
+  // Tailscale Funnel. When false (default), only tailnet members can connect.
+  //
+  // Enabling Funnel also requires your tailnet policy to grant funnel
+  // permission to the node's ACL tag:
+  //   https://tailscale.com/kb/1223/funnel#enable-funnel
+  "AllowFunnel": {
+    "${TS_CERT_DOMAIN}:443": false
+    // "${TS_CERT_DOMAIN}:443": true   ← set to true to expose publicly
+  }
+}

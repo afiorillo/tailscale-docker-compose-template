@@ -1,45 +1,120 @@
+name: ${SERVICE_NAME}
+
+# Network architecture:
+#
+#   [internet] ←──→ [tailscale] ←──→ [app network] ←──→ [web]
+#                       ↑                   ↑
+#                  [egress network]      [proxy] ─── egress ──→ [internet]
+#
+# 'app' is internal:true — no default internet gateway.
+# Outbound connections from 'web' must go through the 'proxy' service.
+# 'proxy' and 'tailscale' are the only containers with egress internet access.
+
+networks:
+  app:
+    internal: true  # no internet gateway; web cannot make direct outbound connections
+  egress:           # internet-facing; only proxy and tailscale join this
+
+volumes:
+  caddy_data:
+  ts-lib-var:
+
 services:
-  # A service behind Tailscale. As long as it's (A) `web`, (B) hosts :8080 and (C) depends on Tailscale
-  # then it will be hosted at `https://<service_name>.tailXXXXX.ts.net/`
+
+  # ─── Your service ──────────────────────────────────────────────────────────
+  # Replace this with whatever you want to expose over Tailscale.
+  # Requirements:
+  #   - service name must be "web" (referenced in tsconfig/serve.json)
+  #   - must listen on port 8080 inside the container (or update serve.json)
+  #   - do NOT add a 'ports:' mapping — all inbound traffic comes via Tailscale
+  #     Exception: bind to loopback to make the service accessible on the host
+  #     itself without going through Tailscale (e.g. for local debugging):
+  #     ports:
+  #       - "127.0.0.1:9090:8080"
   #
-  # Note that the exposed ports are for the host, not Tailscale. Tailscale forwards to the port within
-  # the container.
+  # Outbound connections: the web container has no internet gateway by default.
+  # HTTP_PROXY / HTTPS_PROXY point to the Caddy forward proxy, which enforces
+  # the allowlist defined in proxy/Caddyfile. Most HTTP clients (curl,
+  # python-requests, Go net/http, node-fetch) respect these env vars automatically.
+  # Add NO_PROXY for destinations that should bypass the proxy entirely.
   web:
     image: caddy:2
-    restart: unless-stopped
     container_name: caddy-server
     command: caddy file-server --browse --root /usr/share/caddy --listen :8080
     volumes:
       - ./www/:/usr/share/caddy/:ro
       - caddy_data:/data
-    ports:
-      - 9090:8080
+    environment:
+      - HTTP_PROXY=http://proxy:8080
+      - HTTPS_PROXY=http://proxy:8080
+      - NO_PROXY=localhost,127.0.0.1,tailscale
+    networks:
+      - app
     depends_on:
       - tailscale
+      - proxy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
 
-  # The tailscale service. It connects to Tailscale and hosts a server based on the 
-  # configuration in tsconfig/serve.json . By default it expects to forward to
-  # `http://web:8080` .
+  # ─── Outbound proxy ────────────────────────────────────────────────────────
+  # Caddy with the forwardproxy plugin enforces the outbound allowlist.
+  # Edit proxy/Caddyfile to add permitted destination IPs/CIDRs.
+  # Denied requests are logged to stdout — view with: docker logs forward-proxy
+  #
+  # Built locally because the forwardproxy plugin is not in the official
+  # Caddy image. The build is cached after the first run.
+  proxy:
+    build: ./proxy
+    container_name: forward-proxy
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+    networks:
+      - app     # web container reaches proxy here
+      - egress  # proxy makes permitted outbound connections here
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+  # ─── Tailscale ─────────────────────────────────────────────────────────────
+  # Secure inbound gateway. Terminates TLS and reverse-proxies to the web
+  # service. Also on the egress network for the WireGuard coordination server.
   tailscale:
     image: tailscale/tailscale:stable
     hostname: ${SERVICE_NAME}
     environment:
+      # Path to the serve config inside the container.
+      # See tsconfig/serve.json (working config) and
+      #     tsconfig/serve.example.jsonc (annotated reference).
       - TS_SERVE_CONFIG=/etc/tailscale/config/serve.json
+
+      # Auth key from https://login.tailscale.com/admin/settings/keys
+      # Recommendation: use an ephemeral, pre-approved key with an ACL tag.
       - TS_AUTHKEY=${TS_AUTHKEY}
-      - TS_EXTRA_ARGS=${TS_EXTRA_ARGS}
+
+      # Extra CLI flags passed to 'tailscale up'.
+      # --reset clears stale serve config left from a previous run.
+      - TS_EXTRA_ARGS=${TS_EXTRA_ARGS:---reset}
+
       - TS_STATE_DIR=/var/lib/tailscale
     volumes:
       - ./tsconfig/:/etc/tailscale/config/:ro
       - ts-lib-var:/var/lib/tailscale
       - /dev/net/tun:/dev/net/tun
     cap_add:
-      - net_admin
-      - sys_module
+      - net_admin   # required to configure the WireGuard tunnel interface
+      - sys_module  # required to load kernel modules (wireguard)
+    networks:
+      - app         # reaches the web service by hostname "web"
+      - egress      # reaches the Tailscale coordination server
     restart: unless-stopped
-
-volumes:
-  caddy_data: # any Docker-managed service volumes can be put here 
-
-  # Tailscale state dir.
-  ts-lib-var:
-    driver: local
+    security_opt:
+      - no-new-privileges:true

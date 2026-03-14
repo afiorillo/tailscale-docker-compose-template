@@ -1,0 +1,35 @@
+# Outbound forward proxy for the web container.
+#
+# The web container has no internet gateway (internal Docker network).
+# Outbound connections must go through here via HTTP_PROXY / HTTPS_PROXY.
+# This Caddyfile is the single source of truth for the outbound allowlist.
+#
+# Plugin docs: https://github.com/caddyserver/forwardproxy
+
+:8080 {
+    route {
+        forward_proxy {
+            # Strip identifying headers from forwarded requests.
+            hide_ip
+            hide_via
+
+            # ── Allowlist ─────────────────────────────────────────────────────
+            # Add an 'allow ips' line for each permitted destination.
+            # 'deny all' at the end makes this default-deny.
+            #
+            # To find the IPs for a hostname:
+            #   docker run --rm --network=<stack>_egress alpine nslookup example.com
+            #
+            acl {
+                allow ips 1.0.0.1/32             # 1.0.0.1 (Cloudflare DNS)
+                deny  all
+            }
+        }
+    }
+
+    # Structured JSON log — denied requests appear as errors here.
+    # View with: docker logs forward-proxy
+    log {
+        format json
+    }
+}

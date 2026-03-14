@@ -12,6 +12,9 @@
             "Handlers": {
                 "/": {
                     "Proxy": "http://web:8080"
+                },
+                "/healthz": {
+                    "Text": "ok"
                 }
             }
         },
